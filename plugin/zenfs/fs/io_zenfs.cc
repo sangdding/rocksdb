@@ -109,12 +109,22 @@ void ZoneFile::EncodeJson(std::ostream& json_stream) {
   json_stream << "\"id\":" << file_id_ << ",";
   json_stream << "\"size\":" << file_size_ << ",";
   json_stream << "\"hint\":" << lifetime_ << ",";
-  json_stream << "\"extents\":[";
-
-  for (const auto& name : GetLinkFiles())
-    json_stream << "\"filename\":\"" << name << "\",";
+  json_stream << "\"filename\":[";
 
   bool first_element = true;
+  for (const auto& name : GetLinkFiles()) {
+    if (first_element) {
+      first_element = false;
+    } else {
+      json_stream << ",";
+    }
+    json_stream << "\"" << name << "\"";
+  }
+  json_stream << "],";
+
+  json_stream << "\"extents\":[";
+
+  first_element = true;
   for (ZoneExtent* extent : extents_) {
     if (first_element) {
       first_element = false;
@@ -227,7 +237,8 @@ Status ZoneFile::MergeUpdate(std::shared_ptr<ZoneFile> update, bool replace) {
   return Status::OK();
 }
 
-ZoneFile::ZoneFile(ZonedBlockDevice* zbd, uint64_t file_id)
+ZoneFile::ZoneFile(ZonedBlockDevice* zbd, uint64_t file_id,
+                   MetadataWriter* metadata_writer)
     : zbd_(zbd),
       active_zone_(NULL),
       extent_start_(NO_EXTENT),
@@ -237,7 +248,8 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, uint64_t file_id)
       file_size_(0),
       file_id_(file_id),
       nr_synced_extents_(0),
-      m_time_(0) {}
+      m_time_(0),
+      metadata_writer_(metadata_writer) {}
 
 std::string ZoneFile::GetFilename() { return linkfiles_[0]; }
 time_t ZoneFile::GetFileModificationTime() { return m_time_; }
@@ -247,13 +259,7 @@ void ZoneFile::SetFileSize(uint64_t sz) { file_size_ = sz; }
 void ZoneFile::SetFileModificationTime(time_t mt) { m_time_ = mt; }
 void ZoneFile::SetIOType(IOType io_type) { io_type_ = io_type; }
 
-ZoneFile::~ZoneFile() {
-  ClearExtents();
-  IOStatus s = CloseWR();
-  if (!s.ok()) {
-    zbd_->SetZoneDeferredStatus(s);
-  }
-}
+ZoneFile::~ZoneFile() { ClearExtents(); }
 
 void ZoneFile::ClearExtents() {
   for (auto e = std::begin(extents_); e != std::end(extents_); ++e) {
@@ -264,19 +270,6 @@ void ZoneFile::ClearExtents() {
     delete *e;
   }
   extents_.clear();
-}
-
-IOStatus ZoneFile::CloseWR() {
-  IOStatus s;
-  if (open_for_wr_) {
-    /* Mark up the file as being closed */
-    extent_start_ = NO_EXTENT;
-    s = PersistMetadata();
-    if (!s.ok()) return s;
-    open_for_wr_ = false;
-    s = CloseActiveZone();
-  }
-  return s;
 }
 
 IOStatus ZoneFile::CloseActiveZone() {
@@ -296,12 +289,34 @@ IOStatus ZoneFile::CloseActiveZone() {
   return s;
 }
 
-void ZoneFile::OpenWR(MetadataWriter* metadata_writer) {
+void ZoneFile::AcquireWRLock() {
+  open_for_wr_mtx_.lock();
   open_for_wr_ = true;
-  metadata_writer_ = metadata_writer;
+}
+
+bool ZoneFile::TryAcquireWRLock() {
+  if (!open_for_wr_mtx_.try_lock()) return false;
+  open_for_wr_ = true;
+  return true;
+}
+
+void ZoneFile::ReleaseWRLock() {
+  assert(open_for_wr_);
+  open_for_wr_ = false;
+  open_for_wr_mtx_.unlock();
 }
 
 bool ZoneFile::IsOpenForWR() { return open_for_wr_; }
+
+IOStatus ZoneFile::CloseWR() {
+  IOStatus s;
+  /* Mark up the file as being closed */
+  extent_start_ = NO_EXTENT;
+  s = PersistMetadata();
+  if (!s.ok()) return s;
+  ReleaseWRLock();
+  return CloseActiveZone();
+}
 
 IOStatus ZoneFile::PersistMetadata() {
   assert(metadata_writer_ != NULL);
@@ -320,6 +335,38 @@ ZoneExtent* ZoneFile::GetExtent(uint64_t file_offset, uint64_t* dev_offset) {
   return NULL;
 }
 
+IOStatus ZoneFile::InvalidateCache(uint64_t pos, uint64_t size) {
+  ReadLock lck(this);
+  uint64_t offset = pos;
+  uint64_t left = size;
+  IOStatus s = IOStatus::OK();
+
+  if (left == 0) {
+    left = GetFileSize();
+  }
+
+  while (left) {
+    uint64_t dev_offset;
+    ZoneExtent* extent = GetExtent(offset, &dev_offset);
+
+    if (!extent) {
+      s = IOStatus::IOError("Extent not found while invalidating cache");
+      break;
+    }
+
+    uint64_t extent_end = extent->start_ + extent->length_;
+    uint64_t invalidate_size = std::min(left, extent_end - dev_offset);
+
+    s = zbd_->InvalidateCache(dev_offset, invalidate_size);
+    if (!s.ok()) break;
+
+    left -= invalidate_size;
+    offset += invalidate_size;
+  }
+
+  return s;
+}
+
 IOStatus ZoneFile::PositionedRead(uint64_t offset, size_t n, Slice* result,
                                   char* scratch, bool direct) {
   ZenFSMetricsLatencyGuard guard(zbd_->GetMetrics(), ZENFS_READ_LATENCY,
@@ -328,8 +375,6 @@ IOStatus ZoneFile::PositionedRead(uint64_t offset, size_t n, Slice* result,
 
   ReadLock lck(this);
 
-  int f = zbd_->GetReadFD();
-  int f_direct = zbd_->GetReadDirectFD();
   char* ptr;
   uint64_t r_off;
   size_t r_sz;
@@ -378,18 +423,8 @@ IOStatus ZoneFile::PositionedRead(uint64_t offset, size_t n, Slice* result,
       aligned = true;
     }
 
-    if (direct && aligned) {
-      r = pread(f_direct, ptr, pread_sz, r_off);
-    } else {
-      r = pread(f, ptr, pread_sz, r_off);
-    }
-
-    if (r <= 0) {
-      if (r == -1 && errno == EINTR) {
-        continue;
-      }
-      break;
-    }
+    r = zbd_->Read(ptr, r_off, pread_sz, direct && aligned);
+    if (r <= 0) break;
 
     /* Verify and update the the bytes read count (if read size was incremented,
      * for alignment purposes).
@@ -614,9 +649,9 @@ IOStatus ZoneFile::RecoverSparseExtents(uint64_t start, uint64_t end,
   /* Sparse writes, we need to recover each individual segment */
   IOStatus s;
   uint32_t block_sz = GetBlockSize();
-  int f = zbd_->GetReadFD();
   uint64_t next_extent_start = start;
   char* buffer;
+  int recovered_segments = 0;
   int ret;
 
   ret = posix_memalign((void**)&buffer, sysconf(_SC_PAGESIZE), block_sz);
@@ -627,7 +662,7 @@ IOStatus ZoneFile::RecoverSparseExtents(uint64_t start, uint64_t end,
   while (next_extent_start < end) {
     uint64_t extent_length;
 
-    ret = pread(f, (void*)buffer, block_sz, next_extent_start);
+    ret = zbd_->Read(buffer, next_extent_start, block_sz, false);
     if (ret != (int)block_sz) {
       s = IOStatus::IOError("Unexpected read error while recovering");
       break;
@@ -635,9 +670,10 @@ IOStatus ZoneFile::RecoverSparseExtents(uint64_t start, uint64_t end,
 
     extent_length = DecodeFixed64(buffer);
     if (extent_length == 0) {
-      s = IOStatus::IOError("Unexexpeted extent length while recovering");
+      s = IOStatus::IOError("Unexpected extent length while recovering");
       break;
     }
+    recovered_segments++;
 
     zone->used_capacity_ += extent_length;
     extents_.push_back(new ZoneExtent(next_extent_start + SPARSE_HEADER_SIZE,
@@ -705,7 +741,7 @@ IOStatus ZoneFile::Recover() {
 }
 
 void ZoneFile::ReplaceExtentList(std::vector<ZoneExtent*> new_list) {
-  assert(!IsOpenForWR() && new_list.size() > 0);
+  assert(IsOpenForWR() && new_list.size() > 0);
   assert(new_list.size() == extents_.size());
 
   WriteLock lck(this);
@@ -758,8 +794,8 @@ void ZoneFile::SetActiveZone(Zone* zone) {
 }
 
 ZonedWritableFile::ZonedWritableFile(ZonedBlockDevice* zbd, bool _buffered,
-                                     std::shared_ptr<ZoneFile> zoneFile,
-                                     MetadataWriter* metadata_writer) {
+                                     std::shared_ptr<ZoneFile> zoneFile) {
+  assert(zoneFile->IsOpenForWR());
   wp = zoneFile->GetFileSize();
 
   buffered = _buffered;
@@ -794,7 +830,7 @@ ZonedWritableFile::ZonedWritableFile(ZonedBlockDevice* zbd, bool _buffered,
     }
   }
 
-  zoneFile_->OpenWR(metadata_writer);
+  open = true;
 }
 
 ZonedWritableFile::~ZonedWritableFile() {
@@ -888,14 +924,18 @@ IOStatus ZonedWritableFile::Close(const IOOptions& /*options*/,
 }
 
 IOStatus ZonedWritableFile::CloseInternal() {
-  if (!zoneFile_->IsOpenForWR()) {
+  if (!open) {
     return IOStatus::OK();
   }
 
   IOStatus s = DataSync();
   if (!s.ok()) return s;
 
-  return zoneFile_->CloseWR();
+  s = zoneFile_->CloseWR();
+  if (!s.ok()) return s;
+
+  open = false;
+  return s;
 }
 
 IOStatus ZonedWritableFile::FlushBuffer() {
@@ -1039,29 +1079,6 @@ IOStatus ZonedRandomAccessFile::Read(uint64_t offset, size_t n,
   return zoneFile_->PositionedRead(offset, n, result, scratch, direct_);
 }
 
-size_t ZoneFile::GetUniqueId(char* id, size_t max_size) {
-  /* Based on the posix fs implementation */
-  if (max_size < kMaxVarint64Length * 3) {
-    return 0;
-  }
-
-  struct stat buf;
-  int fd = zbd_->GetReadFD();
-  int result = fstat(fd, &buf);
-  if (result == -1) {
-    return 0;
-  }
-
-  char* rid = id;
-  rid = EncodeVarint64(rid, buf.st_dev);
-  rid = EncodeVarint64(rid, buf.st_ino);
-  rid = EncodeVarint64(rid, file_id_);
-  assert(rid >= id);
-  return static_cast<size_t>(rid - id);
-
-  return 0;
-}
-
 IOStatus ZoneFile::MigrateData(uint64_t offset, uint32_t length,
                                Zone* target_zone) {
   uint32_t step = 128 << 10;
@@ -1084,7 +1101,7 @@ IOStatus ZoneFile::MigrateData(uint64_t offset, uint32_t length,
     read_sz = length > read_sz ? read_sz : length;
     pad_sz = read_sz % block_sz == 0 ? 0 : (block_sz - (read_sz % block_sz));
 
-    int r = zbd_->DirectRead(buf, offset, read_sz + pad_sz);
+    int r = zbd_->Read(buf, offset, read_sz + pad_sz, true);
     if (r < 0) {
       free(buf);
       return IOStatus::IOError(strerror(errno));
@@ -1097,10 +1114,6 @@ IOStatus ZoneFile::MigrateData(uint64_t offset, uint32_t length,
   free(buf);
 
   return IOStatus::OK();
-}
-
-size_t ZonedRandomAccessFile::GetUniqueId(char* id, size_t max_size) const {
-  return zoneFile_->GetUniqueId(id, max_size);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

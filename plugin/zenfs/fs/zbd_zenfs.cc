@@ -30,6 +30,8 @@
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
 #include "snapshot.h"
+#include "zbdlib_zenfs.h"
+#include "zonefs_zenfs.h"
 
 #define KB (1024)
 #define MB (1024 * KB)
@@ -46,17 +48,19 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-Zone::Zone(ZonedBlockDevice *zbd, struct zbd_zone *z)
+Zone::Zone(ZonedBlockDevice *zbd, ZonedBlockDeviceBackend *zbd_be,
+           std::unique_ptr<ZoneList> &zones, unsigned int idx)
     : zbd_(zbd),
+      zbd_be_(zbd_be),
       busy_(false),
-      start_(zbd_zone_start(z)),
-      max_capacity_(zbd_zone_capacity(z)),
-      wp_(zbd_zone_wp(z)) {
+      start_(zbd_be->ZoneStart(zones, idx)),
+      max_capacity_(zbd_be->ZoneMaxCapacity(zones, idx)),
+      wp_(zbd_be->ZoneWp(zones, idx)) {
   lifetime_ = Env::WLTH_NOT_SET;
   used_capacity_ = 0;
   capacity_ = 0;
-  if (!(zbd_zone_full(z) || zbd_zone_offline(z) || zbd_zone_rdonly(z)))
-    capacity_ = zbd_zone_capacity(z) - (zbd_zone_wp(z) - zbd_zone_start(z));
+  if (zbd_be->ZoneIsWritable(zones, idx))
+    capacity_ = max_capacity_ - (wp_ - start_);
 }
 
 bool Zone::IsUsed() { return (used_capacity_ > 0); }
@@ -77,26 +81,19 @@ void Zone::EncodeJson(std::ostream &json_stream) {
 }
 
 IOStatus Zone::Reset() {
-  size_t zone_sz = zbd_->GetZoneSize();
-  unsigned int report = 1;
-  struct zbd_zone z;
-  int ret;
+  bool offline;
+  uint64_t max_capacity;
 
   assert(!IsUsed());
   assert(IsBusy());
 
-  ret = zbd_reset_zones(zbd_->GetWriteFD(), start_, zone_sz);
-  if (ret) return IOStatus::IOError("Zone reset failed\n");
+  IOStatus ios = zbd_be_->Reset(start_, &offline, &max_capacity);
+  if (ios != IOStatus::OK()) return ios;
 
-  ret = zbd_report_zones(zbd_->GetReadFD(), start_, zone_sz, ZBD_RO_ALL, &z,
-                         &report);
-
-  if (ret || (report != 1)) return IOStatus::IOError("Zone report failed\n");
-
-  if (zbd_zone_offline(&z))
+  if (offline)
     capacity_ = 0;
   else
-    max_capacity_ = capacity_ = zbd_zone_capacity(&z);
+    max_capacity_ = capacity_ = max_capacity;
 
   wp_ = start_;
   lifetime_ = Env::WLTH_NOT_SET;
@@ -105,31 +102,23 @@ IOStatus Zone::Reset() {
 }
 
 IOStatus Zone::Finish() {
-  size_t zone_sz = zbd_->GetZoneSize();
-  int fd = zbd_->GetWriteFD();
-  int ret;
-
   assert(IsBusy());
 
-  ret = zbd_finish_zones(fd, start_, zone_sz);
-  if (ret) return IOStatus::IOError("Zone finish failed\n");
+  IOStatus ios = zbd_be_->Finish(start_);
+  if (ios != IOStatus::OK()) return ios;
 
   capacity_ = 0;
-  wp_ = start_ + zone_sz;
+  wp_ = start_ + zbd_->GetZoneSize();
 
   return IOStatus::OK();
 }
 
 IOStatus Zone::Close() {
-  size_t zone_sz = zbd_->GetZoneSize();
-  int fd = zbd_->GetWriteFD();
-  int ret;
-
   assert(IsBusy());
 
   if (!(IsEmpty() || IsFull())) {
-    ret = zbd_close_zones(fd, start_, zone_sz);
-    if (ret) return IOStatus::IOError("Zone close failed\n");
+    IOStatus ios = zbd_be_->Close(start_);
+    if (ios != IOStatus::OK()) return ios;
   }
 
   return IOStatus::OK();
@@ -141,7 +130,6 @@ IOStatus Zone::Append(char *data, uint32_t size) {
   zbd_->GetMetrics()->ReportThroughput(ZENFS_ZONE_WRITE_THROUGHPUT, size);
   char *ptr = data;
   uint32_t left = size;
-  int fd = zbd_->GetWriteFD();
   int ret;
 
   if (capacity_ < size)
@@ -150,7 +138,7 @@ IOStatus Zone::Append(char *data, uint32_t size) {
   assert((size % zbd_->GetBlockSize()) == 0);
 
   while (left) {
-    ret = pwrite(fd, ptr, left, wp_);
+    ret = zbd_be_->Write(ptr, left, wp_);
     if (ret < 0) {
       return IOStatus::IOError(strerror(errno));
     }
@@ -159,6 +147,7 @@ IOStatus Zone::Append(char *data, uint32_t size) {
     wp_ += ret;
     capacity_ -= ret;
     left -= ret;
+    zbd_->AddBytesWritten(ret);
   }
 
   return IOStatus::OK();
@@ -176,178 +165,107 @@ inline IOStatus Zone::CheckRelease() {
 
 Zone *ZonedBlockDevice::GetIOZone(uint64_t offset) {
   for (const auto z : io_zones)
-    if (z->start_ <= offset && offset < (z->start_ + zone_sz_)) return z;
+    if (z->start_ <= offset && offset < (z->start_ + zbd_be_->GetZoneSize()))
+      return z;
   return nullptr;
 }
 
-ZonedBlockDevice::ZonedBlockDevice(std::string bdevname,
+ZonedBlockDevice::ZonedBlockDevice(std::string path, ZbdBackendType backend,
                                    std::shared_ptr<Logger> logger,
                                    std::shared_ptr<ZenFSMetrics> metrics)
-    : filename_("/dev/" + bdevname),
-      read_f_(-1),
-      read_direct_f_(-1),
-      write_f_(-1),
-      logger_(logger),
-      metrics_(metrics) {
-  Info(logger_, "New Zoned Block Device: %s", filename_.c_str());
-}
-
-std::string ZonedBlockDevice::ErrorToString(int err) {
-  char *err_str = strerror(err);
-  if (err_str != nullptr) return std::string(err_str);
-  return "";
-}
-
-IOStatus ZonedBlockDevice::CheckScheduler() {
-  std::ostringstream path;
-  std::string s = filename_;
-  std::fstream f;
-
-  s.erase(0, 5);  // Remove "/dev/" from /dev/nvmeXnY
-  path << "/sys/block/" << s << "/queue/scheduler";
-  f.open(path.str(), std::fstream::in);
-  if (!f.is_open()) {
-    return IOStatus::InvalidArgument("Failed to open " + path.str());
+    : logger_(logger), metrics_(metrics) {
+  if (backend == ZbdBackendType::kBlockDev) {
+    zbd_be_ = std::unique_ptr<ZbdlibBackend>(new ZbdlibBackend(path));
+    Info(logger_, "New Zoned Block Device: %s", zbd_be_->GetFilename().c_str());
+  } else if (backend == ZbdBackendType::kZoneFS) {
+    zbd_be_ = std::unique_ptr<ZoneFsBackend>(new ZoneFsBackend(path));
+    Info(logger_, "New zonefs backing: %s", zbd_be_->GetFilename().c_str());
   }
-
-  std::string buf;
-  getline(f, buf);
-  if (buf.find("[mq-deadline]") == std::string::npos) {
-    f.close();
-    return IOStatus::InvalidArgument(
-        "Current ZBD scheduler is not mq-deadline, set it to mq-deadline.");
-  }
-
-  f.close();
-  return IOStatus::OK();
 }
 
 IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
-  struct zbd_zone *zone_rep;
-  unsigned int reported_zones;
-  uint64_t addr_space_sz;
-  zbd_info info;
+  std::unique_ptr<ZoneList> zone_rep;
+  unsigned int max_nr_active_zones;
+  unsigned int max_nr_open_zones;
   Status s;
   uint64_t i = 0;
   uint64_t m = 0;
   // Reserve one zone for metadata and another one for extent migration
   int reserved_zones = 2;
-  int ret;
 
   if (!readonly && !exclusive)
     return IOStatus::InvalidArgument("Write opens must be exclusive");
 
-  /* The non-direct file descriptor acts as an exclusive-use semaphore */
-  if (exclusive) {
-    read_f_ = zbd_open(filename_.c_str(), O_RDONLY | O_EXCL, &info);
-  } else {
-    read_f_ = zbd_open(filename_.c_str(), O_RDONLY, &info);
-  }
-
-  if (read_f_ < 0) {
-    return IOStatus::InvalidArgument(
-        "Failed to open zoned block device for read: " + ErrorToString(errno));
-  }
-
-  read_direct_f_ = zbd_open(filename_.c_str(), O_RDONLY | O_DIRECT, &info);
-  if (read_direct_f_ < 0) {
-    return IOStatus::InvalidArgument(
-        "Failed to open zoned block device for direct read: " +
-        ErrorToString(errno));
-  }
-
-  if (readonly) {
-    write_f_ = -1;
-  } else {
-    write_f_ = zbd_open(filename_.c_str(), O_WRONLY | O_DIRECT, &info);
-    if (write_f_ < 0) {
-      return IOStatus::InvalidArgument(
-          "Failed to open zoned block device for write: " +
-          ErrorToString(errno));
-    }
-  }
-
-  if (info.model != ZBD_DM_HOST_MANAGED) {
-    return IOStatus::NotSupported("Not a host managed block device");
-  }
-
-  if (info.nr_zones < ZENFS_MIN_ZONES) {
-    return IOStatus::NotSupported(
-        "To few zones on zoned block device (32 required)");
-  }
-
-  IOStatus ios = CheckScheduler();
+  IOStatus ios = zbd_be_->Open(readonly, exclusive, &max_nr_active_zones,
+                               &max_nr_open_zones);
   if (ios != IOStatus::OK()) return ios;
 
-  block_sz_ = info.pblock_size;
-  zone_sz_ = info.zone_size;
-  nr_zones_ = info.nr_zones;
+  if (zbd_be_->GetNrZones() < ZENFS_MIN_ZONES) {
+    return IOStatus::NotSupported("To few zones on zoned backend (" +
+                                  std::to_string(ZENFS_MIN_ZONES) +
+                                  " required)");
+  }
 
-  if (info.max_nr_active_zones == 0)
-    max_nr_active_io_zones_ = info.nr_zones;
+  if (max_nr_active_zones == 0)
+    max_nr_active_io_zones_ = zbd_be_->GetNrZones();
   else
-    max_nr_active_io_zones_ = info.max_nr_active_zones - reserved_zones;
+    max_nr_active_io_zones_ = max_nr_active_zones - reserved_zones;
 
-  if (info.max_nr_open_zones == 0)
-    max_nr_open_io_zones_ = info.nr_zones;
+  if (max_nr_open_zones == 0)
+    max_nr_open_io_zones_ = zbd_be_->GetNrZones();
   else
-    max_nr_open_io_zones_ = info.max_nr_open_zones - reserved_zones;
+    max_nr_open_io_zones_ = max_nr_open_zones - reserved_zones;
 
   Info(logger_, "Zone block device nr zones: %u max active: %u max open: %u \n",
-       info.nr_zones, info.max_nr_active_zones, info.max_nr_open_zones);
+       zbd_be_->GetNrZones(), max_nr_active_zones, max_nr_open_zones);
 
-  addr_space_sz = (uint64_t)nr_zones_ * zone_sz_;
-
-  ret = zbd_list_zones(read_f_, 0, addr_space_sz, ZBD_RO_ALL, &zone_rep,
-                       &reported_zones);
-
-  if (ret || reported_zones != nr_zones_) {
-    Error(logger_, "Failed to list zones, err: %d", ret);
+  zone_rep = zbd_be_->ListZones();
+  if (zone_rep == nullptr || zone_rep->ZoneCount() != zbd_be_->GetNrZones()) {
+    Error(logger_, "Failed to list zones");
     return IOStatus::IOError("Failed to list zones");
   }
 
-  while (m < ZENFS_META_ZONES && i < reported_zones) {
-    struct zbd_zone *z = &zone_rep[i++];
+  while (m < ZENFS_META_ZONES && i < zone_rep->ZoneCount()) {
     /* Only use sequential write required zones */
-    if (zbd_zone_type(z) == ZBD_ZONE_TYPE_SWR) {
-      if (!zbd_zone_offline(z)) {
-        meta_zones.push_back(new Zone(this, z));
+    if (zbd_be_->ZoneIsSwr(zone_rep, i)) {
+      if (!zbd_be_->ZoneIsOffline(zone_rep, i)) {
+        meta_zones.push_back(new Zone(this, zbd_be_.get(), zone_rep, i));
       }
       m++;
     }
+    i++;
   }
 
   active_io_zones_ = 0;
   open_io_zones_ = 0;
 
-  for (; i < reported_zones; i++) {
-    struct zbd_zone *z = &zone_rep[i];
+  for (; i < zone_rep->ZoneCount(); i++) {
     /* Only use sequential write required zones */
-    if (zbd_zone_type(z) == ZBD_ZONE_TYPE_SWR) {
-      if (!zbd_zone_offline(z)) {
-        Zone *newZone = new Zone(this, z);
+    if (zbd_be_->ZoneIsSwr(zone_rep, i)) {
+      if (!zbd_be_->ZoneIsOffline(zone_rep, i)) {
+        Zone *newZone = new Zone(this, zbd_be_.get(), zone_rep, i);
         if (!newZone->Acquire()) {
           assert(false);
           return IOStatus::Corruption("Failed to set busy flag of zone " +
                                       std::to_string(newZone->GetZoneNr()));
         }
         io_zones.push_back(newZone);
-        if (zbd_zone_imp_open(z) || zbd_zone_exp_open(z) ||
-            zbd_zone_closed(z)) {
+        if (zbd_be_->ZoneIsActive(zone_rep, i)) {
           active_io_zones_++;
-          if (zbd_zone_imp_open(z) || zbd_zone_exp_open(z)) {
+          if (zbd_be_->ZoneIsOpen(zone_rep, i)) {
             if (!readonly) {
               newZone->Close();
             }
           }
         }
         IOStatus status = newZone->CheckRelease();
-        if (!status.ok()) return status;
+        if (!status.ok()) {
+          return status;
+        }
       }
     }
   }
 
-  free(zone_rep);
   start_time_ = time(NULL);
 
   return IOStatus::OK();
@@ -428,18 +346,25 @@ void ZonedBlockDevice::LogGarbageInfo() {
   // the result to be precise.
   int zone_gc_stat[12] = {0};
   for (auto z : io_zones) {
-    if (z->IsEmpty()) {
-      zone_gc_stat[0]++;
-      continue;
-    }
-
     if (!z->Acquire()) {
       continue;
     }
 
-    double garbage_rate =
-        double(z->wp_ - z->start_ - z->used_capacity_) / z->max_capacity_;
-    assert(garbage_rate > 0);
+    if (z->IsEmpty()) {
+      zone_gc_stat[0]++;
+      z->Release();
+      continue;
+    }
+
+    double garbage_rate = 0;
+    if (z->IsFull()) {
+      garbage_rate =
+          double(z->max_capacity_ - z->used_capacity_) / z->max_capacity_;
+    } else {
+      garbage_rate =
+          double(z->wp_ - z->start_ - z->used_capacity_) / z->max_capacity_;
+    }
+    assert(garbage_rate >= 0);
     int idx = int((garbage_rate + 0.1) * 10);
     zone_gc_stat[idx]++;
 
@@ -463,10 +388,6 @@ ZonedBlockDevice::~ZonedBlockDevice() {
   for (const auto z : io_zones) {
     delete z;
   }
-
-  zbd_close(read_f_);
-  zbd_close(read_direct_f_);
-  zbd_close(write_f_);
 }
 
 #define LIFETIME_DIFF_NOT_GOOD (100)
@@ -726,14 +647,22 @@ IOStatus ZonedBlockDevice::AllocateEmptyZone(Zone **zone_out) {
   return IOStatus::OK();
 }
 
-int ZonedBlockDevice::DirectRead(char *buf, uint64_t offset, int n) {
+IOStatus ZonedBlockDevice::InvalidateCache(uint64_t pos, uint64_t size) {
+  int ret = zbd_be_->InvalidateCache(pos, size);
+
+  if (ret) {
+    return IOStatus::IOError("Failed to invalidate cache");
+  }
+  return IOStatus::OK();
+}
+
+int ZonedBlockDevice::Read(char *buf, uint64_t offset, int n, bool direct) {
   int ret = 0;
   int left = n;
   int r = -1;
-  int f = GetReadDirectFD();
 
   while (left) {
-    r = pread(f, buf, left, offset);
+    r = zbd_be_->Read(buf, left, offset, direct);
     if (r <= 0) {
       if (r == -1 && errno == EINTR) {
         continue;
@@ -901,9 +830,13 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
   return IOStatus::OK();
 }
 
-std::string ZonedBlockDevice::GetFilename() { return filename_; }
+std::string ZonedBlockDevice::GetFilename() { return zbd_be_->GetFilename(); }
 
-uint32_t ZonedBlockDevice::GetBlockSize() { return block_sz_; }
+uint32_t ZonedBlockDevice::GetBlockSize() { return zbd_be_->GetBlockSize(); }
+
+uint64_t ZonedBlockDevice::GetZoneSize() { return zbd_be_->GetZoneSize(); }
+
+uint32_t ZonedBlockDevice::GetNrZones() { return zbd_be_->GetNrZones(); }
 
 void ZonedBlockDevice::EncodeJsonZone(std::ostream &json_stream,
                                       const std::vector<Zone *> zones) {

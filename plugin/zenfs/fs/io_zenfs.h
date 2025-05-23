@@ -68,6 +68,8 @@ class ZoneFile {
 
   uint32_t nr_synced_extents_ = 0;
   bool open_for_wr_ = false;
+  std::mutex open_for_wr_mtx_;
+
   time_t m_time_;
   bool is_sparse_ = false;
   bool is_deleted_ = false;
@@ -80,13 +82,18 @@ class ZoneFile {
  public:
   static const int SPARSE_HEADER_SIZE = 8;
 
-  explicit ZoneFile(ZonedBlockDevice* zbd, uint64_t file_id_);
+  explicit ZoneFile(ZonedBlockDevice* zbd, uint64_t file_id_,
+                    MetadataWriter* metadata_writer);
 
   virtual ~ZoneFile();
 
-  void OpenWR(MetadataWriter* metadata_writer);
+  void AcquireWRLock();
+  bool TryAcquireWRLock();
+  void ReleaseWRLock();
+
   IOStatus CloseWR();
   bool IsOpenForWR();
+
   IOStatus PersistMetadata();
 
   IOStatus Append(void* buffer, int data_size);
@@ -127,7 +134,6 @@ class ZoneFile {
   Status MergeUpdate(std::shared_ptr<ZoneFile> update, bool replace);
 
   uint64_t GetID() { return file_id_; }
-  size_t GetUniqueId(char* id, size_t max_size);
 
   bool IsSparse() { return is_sparse_; };
 
@@ -143,6 +149,8 @@ class ZoneFile {
   IOStatus RenameLink(const std::string& src, const std::string& dest);
   uint32_t GetNrLinks() { return linkfiles_.size(); }
   const std::vector<std::string>& GetLinkFiles() const { return linkfiles_; }
+
+  IOStatus InvalidateCache(uint64_t pos, uint64_t size);
 
  private:
   void ReleaseActiveZone();
@@ -186,8 +194,7 @@ class ZoneFile {
 class ZonedWritableFile : public FSWritableFile {
  public:
   explicit ZonedWritableFile(ZonedBlockDevice* zbd, bool buffered,
-                             std::shared_ptr<ZoneFile> zoneFile,
-                             MetadataWriter* metadata_writer = nullptr);
+                             std::shared_ptr<ZoneFile> zoneFile);
   virtual ~ZonedWritableFile();
 
   virtual IOStatus Append(const Slice& data, const IOOptions& options,
@@ -248,6 +255,7 @@ class ZonedWritableFile : public FSWritableFile {
   uint32_t buffer_pos;
   uint64_t wp;
   int write_temp;
+  bool open;
 
   std::shared_ptr<ZoneFile> zoneFile_;
   MetadataWriter* metadata_writer_;
@@ -281,8 +289,8 @@ class ZonedSequentialFile : public FSSequentialFile {
     return zoneFile_->GetBlockSize();
   }
 
-  IOStatus InvalidateCache(size_t /*offset*/, size_t /*length*/) override {
-    return IOStatus::OK();
+  IOStatus InvalidateCache(size_t offset, size_t length) override {
+    return zoneFile_->InvalidateCache(offset, length);
   }
 };
 
@@ -313,11 +321,9 @@ class ZonedRandomAccessFile : public FSRandomAccessFile {
     return zoneFile_->GetBlockSize();
   }
 
-  IOStatus InvalidateCache(size_t /*offset*/, size_t /*length*/) override {
-    return IOStatus::OK();
+  IOStatus InvalidateCache(size_t offset, size_t length) override {
+    return zoneFile_->InvalidateCache(offset, length);
   }
-
-  size_t GetUniqueId(char* id, size_t max_size) const override;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

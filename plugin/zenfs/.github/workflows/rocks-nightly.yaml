@@ -1,17 +1,21 @@
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 01 * * *'
+    - cron: '0 02 * * *'
 name: Smoke RocksDB Nightly
 jobs:
   smoke-nightly:
     runs-on: self-hosted
     name: Smoke Nightly ${{ matrix.rocksdb-ref }}
     strategy:
+      fail-fast: false
       matrix:
         rocksdb-ref:
           - main
-          - 7.0.fb
+          - 6.29.fb
+          - 7.2.fb
+          - 7.10.fb
+          - 8.7.fb
     steps:
       - name: Clean
         run: rm -rf ${GITHUB_WORKSPACE}/*

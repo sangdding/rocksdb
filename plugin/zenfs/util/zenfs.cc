@@ -31,6 +31,7 @@ using GFLAGS_NAMESPACE::RegisterFlagValidator;
 using GFLAGS_NAMESPACE::SetUsageMessage;
 
 DEFINE_string(zbd, "", "Path to a zoned block device.");
+DEFINE_string(zonefs, "", "Path to a zonefs mountpoint.");
 DEFINE_string(aux_path, "",
               "Path for auxiliary file storage (log and lock files).");
 DEFINE_bool(
@@ -46,6 +47,7 @@ DEFINE_string(restore_path, "", "Path to restore files");
 DEFINE_string(backup_path, "", "Path to backup files");
 DEFINE_string(src_file, "", "Source file path");
 DEFINE_string(dest_file, "", "Destination file path");
+DEFINE_bool(enable_gc, false, "Enable garbage collection");
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -54,8 +56,11 @@ void AddDirSeparatorAtEnd(std::string &path) {
 }
 
 std::unique_ptr<ZonedBlockDevice> zbd_open(bool readonly, bool exclusive) {
-  std::unique_ptr<ZonedBlockDevice> zbd{
-      new ZonedBlockDevice(FLAGS_zbd, nullptr)};
+  std::unique_ptr<ZonedBlockDevice> zbd{new ZonedBlockDevice(
+      FLAGS_zbd.empty() ? FLAGS_zonefs : FLAGS_zbd,
+      FLAGS_zbd.empty() ? ZbdBackendType::kZoneFS : ZbdBackendType::kBlockDev,
+      nullptr)};
+
   IOStatus open_status = zbd->Open(readonly, exclusive);
 
   if (!open_status.ok()) {
@@ -177,7 +182,7 @@ int zenfs_tool_mkfs() {
 
   AddDirSeparatorAtEnd(FLAGS_aux_path);
 
-  s = zenFS->MkFS(FLAGS_aux_path, FLAGS_finish_threshold);
+  s = zenFS->MkFS(FLAGS_aux_path, FLAGS_finish_threshold, FLAGS_enable_gc);
   if (!s.ok()) {
     fprintf(stderr, "Failed to create file system, error: %s\n",
             s.ToString().c_str());
@@ -277,7 +282,7 @@ int zenfs_tool_df() {
 }
 
 int zenfs_tool_lsuuid() {
-  std::map<std::string, std::string> zenFileSystems;
+  std::map<std::string, std::pair<std::string, ZbdBackendType>> zenFileSystems;
   Status s = ListZenFileSystems(zenFileSystems);
   if (!s.ok()) {
     fprintf(stderr, "Failed to enumerate file systems: %s",
@@ -286,7 +291,7 @@ int zenfs_tool_lsuuid() {
   }
 
   for (const auto &p : zenFileSystems)
-    fprintf(stdout, "%s\t%s\n", p.first.c_str(), p.second.c_str());
+    fprintf(stdout, "%s\t%s\n", p.first.c_str(), p.second.first.c_str());
 
   return 0;
 }
@@ -515,7 +520,7 @@ int zenfs_tool_backup() {
     }
 
     std::string backup_path = FLAGS_backup_path;
-    AddDirSeparatorAtEnd(backup_path);
+    if (backup_path.size() > 0 && backup_path.back() != '/') backup_path += "/";
     io_status = zenfs_tool_copy_dir(zenFS.get(), backup_path,
                                     FileSystem::Default().get(), FLAGS_path);
   }
@@ -680,7 +685,7 @@ int zenfs_tool_restore() {
   }
 
   AddDirSeparatorAtEnd(FLAGS_restore_path);
-  std::filesystem::path fpath(FLAGS_path);
+  fs::path fpath(FLAGS_path);
   FLAGS_path = fpath.lexically_normal().string();
   FileSystem *f_fs = FileSystem::Default().get();
   status = f_fs->IsDirectory(FLAGS_path, opts, &is_dir, &dbg);
@@ -788,8 +793,16 @@ int main(int argc, char **argv) {
   std::string subcmd(argv[1]);
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-  if (FLAGS_zbd.empty() && subcmd != "ls-uuid") {
-    fprintf(stderr, "You need to specify a zoned block device using --zbd\n");
+  if (FLAGS_zonefs.empty() && FLAGS_zbd.empty() && subcmd != "ls-uuid") {
+    fprintf(
+        stderr,
+        "You need to specify a zoned block device using --zbd or --zonefs\n");
+    return 1;
+  }
+  if (!FLAGS_zonefs.empty() && !FLAGS_zbd.empty()) {
+    fprintf(stderr,
+            "You need to specify a zoned block device using either "
+            "--zbd or --zonefs - not both\n");
     return 1;
   }
   if (subcmd == "mkfs") {

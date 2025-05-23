@@ -1,10 +1,16 @@
 #!/bin/bash
 source smoke/common.sh
 
+if [ "x${PLUGIN_HOST}" = "xterarkdb" ]
+then
+    echo "Running with terarkdb: Skipping db_stress test"
+    exit 0
+fi
+
 OPS_PER_THREAD=1000
 REOPENS=5
 
-DB_STRESS_PARAMS="--ops_per_thread=$OPS_PER_THREAD --reopen=$REOPENS --db=dbname $FS_PARAMS"
+DB_STRESS_PARAMS="--ops_per_thread=$OPS_PER_THREAD --reopen=$REOPENS --db=dbname $FS_PARAMS --read_fault_one_in=0"
 
 echo "# Running db_stress with parameters: $DB_STRESS_PARAMS" > $TEST_OUT
 $TOOLS_DIR/db_stress $DB_STRESS_PARAMS >> $TEST_OUT
