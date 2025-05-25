@@ -15,6 +15,8 @@
 #include <future>
 #include <string>
 #include <iostream>
+#include <chrono>
+#include <fstream>
 
 #include "db/blob/blob_file_builder.h"
 #include "db/compaction/compaction_iterator.h"
@@ -179,7 +181,18 @@ Status BuildTable(
 
       uint64_t filename = meta->fd.GetNumber();
       uint64_t level = 0;
+
+      auto start = std::chrono::high_resolution_clock::now();
       uint64_t prediction_future = async_predict(filename, level, versions->GetDistance(), ToHex(smallest_key), ToHex(largest_key)).get();
+      auto end = std::chrono::high_resolution_clock::now();
+      std::chrono::duration<double, std::milli> elapsed_ms = end - start;
+
+      // 결과 파일에 저장
+      std::ofstream log_file("/root/lsm2/log/overhead.log", std::ios::app); // append mode
+      if (log_file.is_open()) {
+          log_file << "[Prediction] " << elapsed_ms.count() << std::endl;
+          log_file.close();
+      } 
 
       fs->SetFileLifetime(fname, prediction_future, versions->GetDistance(), 0);
       table_file_created = true;

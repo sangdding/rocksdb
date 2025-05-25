@@ -16,6 +16,8 @@
 #include <set>
 #include <utility>
 #include <vector>
+#include <chrono>
+#include <fstream>
 
 #include "db/blob/blob_counting_iterator.h"
 #include "db/blob/blob_file_addition.h"
@@ -1999,7 +2001,20 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
     versions_->AddFileInfo(meta.fd.GetNumber(), sub_compact->compaction->output_level(), versions_->GetDistance(), min_key_str, max_key_str);
     versions_->IncrementDistance();
 
-    auto prediction_future = async_predict(meta.fd.GetNumber(), sub_compact->compaction->output_level(), versions_->GetDistance(), ToHex(min_key_str), ToHex(max_key_str));
+    auto start = std::chrono::high_resolution_clock::now();
+    auto prediction_future = async_predict(
+        meta.fd.GetNumber(), sub_compact->compaction->output_level(),
+        versions_->GetDistance(), ToHex(min_key_str), ToHex(max_key_str));
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> elapsed_ms = end - start;
+
+    // 결과 파일에 저장
+    std::ofstream log_file("/root/lsm2/log/overhead.log",
+                           std::ios::app);  // append mode
+    if (log_file.is_open()) {
+      log_file << "[Prediction] " << elapsed_ms.count() << std::endl;
+      log_file.close();
+    } 
     fs_->SetFileLifetime(GetTableFileName(meta.fd.GetNumber()), prediction_future.get(), versions_->GetDistance(), sub_compact->compaction->output_level());
   } 
 

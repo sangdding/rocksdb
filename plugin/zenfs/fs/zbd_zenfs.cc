@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
@@ -595,7 +596,7 @@ IOStatus ZonedBlockDevice::FinishCheapestIOZone() {
 IOStatus ZonedBlockDevice::GetBestOpenZoneMatch(
   Env::WriteLifeTimeHint /*file_lifetime*/, unsigned int *best_diff_out,
   Zone **zone_out, uint64_t predict_distance, uint32_t min_capacity) {
-  unsigned int best_diff = 10;
+  unsigned int best_diff = 100;
   Zone *allocated_zone = nullptr;
   IOStatus s;
 
@@ -706,8 +707,19 @@ IOStatus ZonedBlockDevice::TakeMigrateZone(Zone **out_zone,
   migrating_ = true;
 
   unsigned int best_diff = LIFETIME_DIFF_NOT_GOOD;
+  auto start = std::chrono::high_resolution_clock::now();
   auto s =
     GetBestOpenZoneMatch(file_lifetime, &best_diff, out_zone, curr_distance_ + 50, min_capacity);
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> elapsed_ms = end - start;
+  // 결과 파일에 저장
+  std::ofstream log_file("/root/lsm2/log/overhead.log",
+                         std::ios::app);  // append mode
+  if (log_file.is_open()) {
+    log_file << "[Seek] " << elapsed_ms.count() << std::endl;
+    log_file.close();
+  }
+
   if (s.ok() && (*out_zone) != nullptr) {
     Info(logger_, "TakeMigrateZone: %lu", (*out_zone)->start_);
   } else {
@@ -755,8 +767,20 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
 
   WaitForOpenIOZoneToken(io_type == IOType::kWAL);
 
+  auto start = std::chrono::high_resolution_clock::now();
+  
   // Try to fill an already open zone(with the best life time diff)
   s = GetBestOpenZoneMatch(file_lifetime, &best_diff, &allocated_zone, predict_distance);
+
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> elapsed_ms = end - start;
+  // 결과 파일에 저장
+  std::ofstream log_file("/root/lsm2/log/overhead.log",
+                         std::ios::app);  // append mode
+  if (log_file.is_open()) {
+    log_file << "[Seek] " << elapsed_ms.count() << std::endl;
+    log_file.close();
+  }
 
   if (!s.ok()) {
     PutOpenIOZoneToken();
