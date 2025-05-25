@@ -38,6 +38,9 @@
 #include <queue>
 #include <thread>
 #include <unordered_map>
+#include <vector>
+#include <random>
+#include <unordered_set>
 
 #include "db/db_impl/db_impl.h"
 #include "db/malloc_stats.h"
@@ -247,7 +250,7 @@ DEFINE_string(
     "Rate limit can be specified through --backup_rate_limit\n"
     "\trestore -- Restore the DB from the latest backup available, rate limit can be specified through --restore_rate_limit\n");
 
-DEFINE_int64(num, 1000000, "Number of key/values to place in database");
+DEFINE_int64(num, 1000000000, "Number of key/values to place in database");
 
 DEFINE_int64(numdistinct, 1000,
              "Number of distinct keys to use. Used in RandomWithVerify to "
@@ -2662,6 +2665,7 @@ struct ThreadState {
   Random64 rand;  // Has different seeds for different threads
   Stats stats;
   SharedState* shared;
+  std::vector<unsigned int> keys;
 
   explicit ThreadState(int index, int my_seed)
       : tid(index), rand(*seed_base + my_seed) {}
@@ -3416,6 +3420,78 @@ class Benchmark {
     exit(1);
   }
 
+  /*
+  distribution_type에 따른 random한 key를 생성합니다.
+  각 key는 unique한 값으로, 중복되지 않습니다. (update 이벤트 방지)
+  */
+  std::vector<unsigned int> generate_unique_keys(size_t N, unsigned int min_val, unsigned int max_val, std::string distribution_type) {
+    std::unordered_set<unsigned int> unique_keys;
+    std::vector<unsigned int> keys;
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+
+    // 분포 정의
+    std::normal_distribution<double> normal_dist((min_val + max_val) / 2.0, (max_val - min_val) / 6.0);
+    std::exponential_distribution<double> exponential_dist(1.0 / ((max_val - min_val) / 2.0));
+    std::chi_squared_distribution<double> chi_squared_dist(4.0);  // 자유도 4
+    std::normal_distribution<double> normal_dist1((min_val + max_val) / 3.0, (max_val - min_val) / 8.0);
+    std::normal_distribution<double> normal_dist2(2 * (min_val + max_val) / 3.0, (max_val - min_val) / 10.0);
+    std::uniform_real_distribution<double> uniform_dist(0.0, max_val);  // Mix-Gauss 결정용
+
+    while (unique_keys.size() < N) {
+        unsigned int key;
+        double ratio = (double) (unique_keys.size()) / N * 100;
+        if (ratio > 90.0) {
+          std::cout << "Generated key.. 90%" << std::endl;
+        } else if (ratio > 70.0) {
+          std::cout << "Generated key.. 70%" << std::endl;
+        } else if (ratio > 50.0) {
+          std::cout << "Generated key.. 50%" << std::endl;
+        } else if (ratio > 30.0) {
+          std::cout << "Generated key.. 30%" << std::endl;
+        } else if (ratio > 10.0) {
+          std::cout << "Generated key.. 10%" << std::endl;
+        }
+        if (distribution_type == "normal") {
+            key = static_cast<unsigned int>(std::round(normal_dist(gen)));
+        } else if (distribution_type == "exponential") {
+            key = static_cast<unsigned int>(std::round(exponential_dist(gen)));
+        } else if (distribution_type == "chi_squared") {
+            key = static_cast<unsigned int>(std::round(chi_squared_dist(gen)));
+        } else if (distribution_type == "mix_gauss") {
+            double mix_ratio = 0.5;  // 두 개의 가우시안 중 하나를 선택할 확률
+            if (uniform_dist(gen) < mix_ratio) {
+                key = static_cast<unsigned int>(std::round(normal_dist1(gen)));
+            } else {
+                key = static_cast<unsigned int>(std::round(normal_dist2(gen)));
+            }
+        } else if (distribution_type == "uniform"){
+            key = static_cast<unsigned int>(std::round(uniform_dist(gen)));
+        } else {
+            throw std::invalid_argument("지원되지 않는 분포입니다. 'normal', 'exponential', 'chi_squared', 'mix_gauss' 중 선택하세요.");
+        }
+
+        if (key >= min_val && key <= max_val && unique_keys.insert(key).second) {
+            keys.push_back(key);
+        }
+    }
+
+    return keys;
+  }
+
+  std::vector<std::vector<unsigned int>> split_vector(
+      const std::vector<unsigned int>& vec, size_t chunk_size) {
+    std::vector<std::vector<unsigned int>> result;
+
+    for (size_t i = 0; i < vec.size(); i += chunk_size) {
+      std::vector<unsigned int> chunk(
+          vec.begin() + i, vec.begin() + std::min(i + chunk_size, vec.size()));
+      result.push_back(chunk);
+    }
+    return result;
+  }
+
   void Run() {
     if (!SanityCheck()) {
       ErrorExit();
@@ -3517,6 +3593,10 @@ class Benchmark {
         } else {
           method = &Benchmark::WriteUniqueRandomDeterministic;
         }
+      } else if (name == "custom") {
+        fresh_db = true;
+        method = &Benchmark::Custom;
+        std::cout << "Benchmark is custom" << std::endl;
       } else if (name == "fillseq") {
         fresh_db = true;
         method = &Benchmark::WriteSeq;
@@ -3976,32 +4056,65 @@ class Benchmark {
 
     ThreadArg* arg = new ThreadArg[n];
 
-    for (int i = 0; i < n; i++) {
+    if (method == &Benchmark::Custom) {
+      std::vector<unsigned int> keys = generate_unique_keys(num_, 0, 4294967295, "mix_gauss"); 
+      size_t chunk_size = num_ / n;
+      std::vector<std::vector<unsigned int>> chunks = split_vector(keys, chunk_size);
+      for (int i = 0; i < n; i++) {
 #ifdef NUMA
-      if (FLAGS_enable_numa) {
-        // Performs a local allocation of memory to threads in numa node.
-        int n_nodes = numa_num_task_nodes();  // Number of nodes in NUMA.
-        numa_exit_on_error = 1;
-        int numa_node = i % n_nodes;
-        bitmask* nodes = numa_allocate_nodemask();
-        numa_bitmask_clearall(nodes);
-        numa_bitmask_setbit(nodes, numa_node);
-        // numa_bind() call binds the process to the node and these
-        // properties are passed on to the thread that is created in
-        // StartThread method called later in the loop.
-        numa_bind(nodes);
-        numa_set_strict(1);
-        numa_free_nodemask(nodes);
-      }
+        if (FLAGS_enable_numa) {
+          // Performs a local allocation of memory to threads in numa node.
+          int n_nodes = numa_num_task_nodes();  // Number of nodes in NUMA.
+          numa_exit_on_error = 1;
+          int numa_node = i % n_nodes;
+          bitmask* nodes = numa_allocate_nodemask();
+          numa_bitmask_clearall(nodes);
+          numa_bitmask_setbit(nodes, numa_node);
+          // numa_bind() call binds the process to the node and these
+          // properties are passed on to the thread that is created in
+          // StartThread method called later in the loop.
+          numa_bind(nodes);
+          numa_set_strict(1);
+          numa_free_nodemask(nodes);
+        }
 #endif
-      arg[i].bm = this;
-      arg[i].method = method;
-      arg[i].shared = &shared;
-      total_thread_count_++;
-      arg[i].thread = new ThreadState(i, total_thread_count_);
-      arg[i].thread->stats.SetReporterAgent(reporter_agent.get());
-      arg[i].thread->shared = &shared;
-      FLAGS_env->StartThread(ThreadBody, &arg[i]);
+        arg[i].bm = this;
+        arg[i].method = method;
+        arg[i].shared = &shared;
+        arg[i].thread = new ThreadState(i, total_thread_count_);
+        arg[i].thread->stats.SetReporterAgent(reporter_agent.get());
+        arg[i].thread->shared = &shared;
+        arg[i].thread->keys = chunks[i];
+        FLAGS_env->StartThread(ThreadBody, &arg[i]);
+      }
+    } else {
+      for (int i = 0; i < n; i++) {
+#ifdef NUMA
+        if (FLAGS_enable_numa) {
+          // Performs a local allocation of memory to threads in numa node.
+          int n_nodes = numa_num_task_nodes();  // Number of nodes in NUMA.
+          numa_exit_on_error = 1;
+          int numa_node = i % n_nodes;
+          bitmask* nodes = numa_allocate_nodemask();
+          numa_bitmask_clearall(nodes);
+          numa_bitmask_setbit(nodes, numa_node);
+          // numa_bind() call binds the process to the node and these
+          // properties are passed on to the thread that is created in
+          // StartThread method called later in the loop.
+          numa_bind(nodes);
+          numa_set_strict(1);
+          numa_free_nodemask(nodes);
+        }
+#endif
+        arg[i].bm = this;
+        arg[i].method = method;
+        arg[i].shared = &shared;
+        total_thread_count_++;
+        arg[i].thread = new ThreadState(i, total_thread_count_);
+        arg[i].thread->stats.SetReporterAgent(reporter_agent.get());
+        arg[i].thread->shared = &shared;
+        FLAGS_env->StartThread(ThreadBody, &arg[i]);
+      }
     }
 
     shared.mu.Lock();
@@ -4999,6 +5112,10 @@ class Benchmark {
 
   enum WriteMode { RANDOM, SEQUENTIAL, UNIQUE_RANDOM };
 
+  void Custom(ThreadState* thread) {
+    DoCustom(thread);
+  }
+
   void WriteSeqDeterministic(ThreadState* thread) {
     DoDeterministicCompact(thread, open_options_.compaction_style, SEQUENTIAL);
   }
@@ -5080,6 +5197,33 @@ class Benchmark {
 
   double SineRate(double x) {
     return FLAGS_sine_a * sin((FLAGS_sine_b * x) + FLAGS_sine_c) + FLAGS_sine_d;
+  }
+
+  void DoCustom(ThreadState* thread) {
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+    RandomGenerator gen;
+    Status s;
+
+    unsigned int cnt = 0;
+    int64_t puts = 0;
+
+    while (cnt < thread->keys.size()) {
+      DBWithColumnFamilies* db_with_cfh = SelectDBWithCfh(thread);
+
+      GenerateKeyFromInt(thread->keys[cnt], FLAGS_num, &key);
+      s = db_with_cfh->db->Put(
+          write_options_, key,
+          gen.Generate(static_cast<unsigned int>(FLAGS_value_size)));
+      thread->stats.FinishedOps(db_with_cfh, db_with_cfh->db, 1, kWrite);
+      cnt++;
+    }
+    char msg[256];
+      snprintf(msg, sizeof(msg),
+               "(Puts:%" PRIu64 "\n",
+               puts);
+      thread->stats.AddBytes(0);
+      thread->stats.AddMessage(msg);
   }
 
   void DoWrite(ThreadState* thread, WriteMode write_mode) {

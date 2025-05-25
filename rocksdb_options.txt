@@ -1,0 +1,21 @@
+[DBOptions]
+
+[CFOptions "default"]
+write_buffer_size=536870912
+target_file_size_base=1073741824
+max_bytes_for_level_base=536870912
+level0_file_num_compaction_trigger=4
+level0_slowdown_writes_trigger=10
+max_write_buffer_number=8
+compression=kLZ4Compression
+bottommost_compression=kLZ4Compression
+compression_opts=-14:4:0
+memtable_prefix_bloom_size_ratio=0.05
+prefix_extractor=capped:12
+compaction_pri=kMinOverlappingRatio
+level_compaction_dynamic_level_bytes=true
+
+block_based_table_factory=cache_index_and_filter_blocks=1;filter_policy=bloomfilter:10:false;whole_key_filtering=0
+optimize_filters_for_hits=true
+
+
