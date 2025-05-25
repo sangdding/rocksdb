@@ -880,6 +880,13 @@ Status FlushJob::WriteLevel0Table() {
     uint64_t total_data_size = 0;
     size_t total_memory_usage = 0;
     uint64_t total_num_range_deletes = 0;
+
+    Slice smallest_key, largest_key;  // 전체 범위의 최소/최대 키
+    bool is_first_key = true;         // 최초 키 탐색 여부
+
+    // 사용자 정의 비교자 가져오기
+    const Comparator* ucmp = cfd_->internal_comparator().user_comparator();
+
     // Used for testing:
     uint64_t mems_size = mems_.size();
     (void)mems_size;  // avoids unused variable error when
@@ -892,6 +899,31 @@ Status FlushJob::WriteLevel0Table() {
           db_options_.info_log,
           "[%s] [JOB %d] Flushing memtable with next log file: %" PRIu64 "\n",
           cfd_->GetName().c_str(), job_context_->job_id, m->GetNextLogNumber());
+
+      // MemTable 반복자 생성
+      auto iter = m->NewIterator(ro, &arena);
+
+      // 최소 키: 첫 번째 키 추출
+      iter->SeekToFirst();
+      if (iter->Valid()) {
+        Slice user_key = ExtractUserKey(iter->key());
+        if (is_first_key || ucmp->Compare(user_key, smallest_key) < 0) {
+          smallest_key = user_key;
+        }
+      }
+
+      // 최대 키: 마지막 키 추출
+      iter->SeekToLast();
+      if (iter->Valid()) {
+        Slice user_key = ExtractUserKey(iter->key());
+        if (is_first_key || ucmp->Compare(user_key, largest_key) > 0) {
+          largest_key = user_key;
+        }
+      }
+
+      // 최초 키 설정 플래그 해제
+      is_first_key = false;
+
       memtables.push_back(m->NewIterator(ro, &arena));
       auto* range_del_iter = m->NewRangeTombstoneIterator(
           ro, kMaxSequenceNumber, true /* immutable_memtable */);
@@ -904,6 +936,14 @@ Status FlushJob::WriteLevel0Table() {
       total_memory_usage += m->ApproximateMemoryUsage();
       total_num_range_deletes += m->num_range_deletes();
     }
+
+    std::string min_key(smallest_key.data(), smallest_key.size());
+    std::string max_key(largest_key.data(), largest_key.size());
+
+    versions_->AddFileInfo(meta_.fd.GetNumber(), 0, versions_->GetDistance(),
+                           min_key,
+                           max_key);
+    versions_->IncrementDistance();
 
     // TODO(cbi): when memtable is flushed due to number of range deletions
     //  hitting limit memtable_max_range_deletions, flush_reason_ is still

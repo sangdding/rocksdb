@@ -30,6 +30,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <iomanip>
 
 #include "cache/cache_helpers.h"
 #include "db/blob/blob_file_meta.h"
@@ -1147,6 +1148,15 @@ class AtomicGroupReadBuffer {
   std::vector<VersionEdit> replay_buffer_;
 };
 
+// 모델 생성 및 예측을 위한 파일 정보 모음
+struct FileInfo {
+  int fd;
+  int level;
+  int distance;
+  std::string min_key;
+  std::string max_key;
+};
+
 // VersionSet is the collection of versions of all the column families of the
 // database. Each database owns one VersionSet. A VersionSet has access to all
 // column families via ColumnFamilySet, i.e. set of the column families.
@@ -1557,6 +1567,39 @@ class VersionSet {
     AppendVersion(cfd, version);
   }
 
+  // distance 값을 증가시키고, 현재 값을 반환
+  int IncrementDistance() {
+    std::lock_guard<std::mutex> lock(distance_mutex_);
+    return ++distance_;
+  }
+
+  // distance 값을 반환 (thread-safe)
+  int GetDistance() const {
+    std::lock_guard<std::mutex> lock(distance_mutex_);
+    return distance_.load();
+  }
+
+  static std::string ToHex(const std::string& input) {
+    std::ostringstream oss;
+    for (unsigned char c : input) {
+      oss << std::hex << std::setw(2) << std::setfill('0') << (int)c;
+    }
+    return oss.str();
+  }
+
+  // 파일 정보 추가
+  void AddFileInfo(int fd, int level, int distance, std::string& min_key, std::string& max_key) {
+    fileinfo_.insert(std::make_pair(fd, FileInfo{fd, level, distance, ToHex(min_key), ToHex(max_key)}));
+  }
+
+  // 파파일 정보 가져오기
+  FileInfo getFileInfo(int fd) {
+    auto it = fileinfo_.find(fd);
+    FileInfo return_val = it->second;
+    fileinfo_.erase(fd);
+    return return_val;  // key에 해당하는 value 가져오기
+  }
+
  protected:
   struct ManifestWriter;
 
@@ -1701,10 +1744,17 @@ class VersionSet {
                            SequenceNumber* max_last_sequence);
   Status LogAndApplyHelper(ColumnFamilyData* cfd, VersionBuilder* b,
                            VersionEdit* edit, SequenceNumber* max_last_sequence,
-                           InstrumentedMutex* mu);
-
+                           InstrumentedMutex* mu); 
   const bool read_only_;
   bool closed_;
+    
+  // distance 추적 변수
+  std::atomic<int> distance_;
+  // distance를 보호하기 위한 뮤텍스
+  mutable std::mutex distance_mutex_;
+
+  // 파일 정보 맵
+  std::map<int, FileInfo> fileinfo_;
 };
 
 // ReactiveVersionSet represents a collection of versions of the column
