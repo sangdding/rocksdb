@@ -1557,6 +1557,18 @@ class VersionSet {
     AppendVersion(cfd, version);
   }
 
+  // distance 값을 증가시키고, 현재 값을 반환
+  int IncrementDistance() {
+    std::lock_guard<std::mutex> lock(distance_mutex_);
+    return ++distance_;
+  }
+
+  // distance 값을 반환 (thread-safe)
+  int GetDistance() const {
+    std::lock_guard<std::mutex> lock(distance_mutex_);
+    return distance_.load();
+  }
+
  protected:
   struct ManifestWriter;
 
@@ -1701,10 +1713,14 @@ class VersionSet {
                            SequenceNumber* max_last_sequence);
   Status LogAndApplyHelper(ColumnFamilyData* cfd, VersionBuilder* b,
                            VersionEdit* edit, SequenceNumber* max_last_sequence,
-                           InstrumentedMutex* mu);
-
+                           InstrumentedMutex* mu); 
   const bool read_only_;
   bool closed_;
+    
+  // distance 추적 변수
+  std::atomic<int> distance_;
+  // distance를 보호하기 위한 뮤텍스
+  mutable std::mutex distance_mutex_;
 };
 
 // ReactiveVersionSet represents a collection of versions of the column

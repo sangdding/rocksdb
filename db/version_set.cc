@@ -5117,7 +5117,8 @@ VersionSet::VersionSet(
       offpeak_time_option_(OffpeakTimeOption(daily_offpeak_time_utc)),
       error_handler_(error_handler),
       read_only_(read_only),
-      closed_(false) {}
+      closed_(false),
+      distance_(0) {}
 
 Status VersionSet::Close(FSDirectory* db_dir, InstrumentedMutex* mu) {
   Status s;
