@@ -1836,6 +1836,14 @@ void CompactionJob::RecordCompactionIOStats() {
   IOSTATS_RESET(bytes_written);
 }
 
+static std::string ToHex(const std::string& input) {
+  std::ostringstream oss;
+  for (unsigned char c : input) {
+    oss << std::hex << std::setw(2) << std::setfill('0') << (int)c;
+  }
+  return oss.str();
+}
+
 Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
                                                CompactionOutputs& outputs) {
   assert(sub_compact != nullptr);
@@ -1990,7 +1998,10 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
 
     versions_->AddFileInfo(meta.fd.GetNumber(), sub_compact->compaction->output_level(), versions_->GetDistance(), min_key_str, max_key_str);
     versions_->IncrementDistance();
-  }
+
+    auto prediction_future = async_predict(meta.fd.GetNumber(), sub_compact->compaction->output_level(), versions_->GetDistance(), ToHex(min_key_str), ToHex(max_key_str));
+    fs_->SetFileLifetime(GetTableFileName(meta.fd.GetNumber()), prediction_future.get(), versions_->GetDistance(), sub_compact->compaction->output_level());
+  } 
 
   writable_file->SetIOPriority(GetRateLimiterPriority());
   writable_file->SetWriteLifeTimeHint(write_hint_);

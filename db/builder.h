@@ -72,6 +72,8 @@ extern Status BuildTable(
     BlobFileCompletionCallback* blob_callback = nullptr,
     Version* version = nullptr, uint64_t* num_input_entries = nullptr,
     uint64_t* memtable_payload_bytes = nullptr,
-    uint64_t* memtable_garbage_bytes = nullptr);
+    uint64_t* memtable_garbage_bytes = nullptr,
+    std::string smallest_key = nullptr,
+    std::string largest_key = nullptr);
 
 }  // namespace ROCKSDB_NAMESPACE

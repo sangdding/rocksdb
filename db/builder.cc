@@ -12,6 +12,9 @@
 #include <algorithm>
 #include <deque>
 #include <vector>
+#include <future>
+#include <string>
+#include <iostream>
 
 #include "db/blob/blob_file_builder.h"
 #include "db/compaction/compaction_iterator.h"
@@ -46,6 +49,17 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+// 예측 프로세스 호출 함수
+extern std::future<uint64_t> async_predict(uint64_t filename, uint64_t level, uint64_t curr_distance, std::string min_key, std::string max_key);
+
+static std::string ToHex(const std::string& input) {
+  std::ostringstream oss;
+  for (unsigned char c : input) {
+    oss << std::hex << std::setw(2) << std::setfill('0') << (int)c;
+  }
+  return oss.str();
+}
+
 class TableFactory;
 
 TableBuilder* NewTableBuilder(const TableBuilderOptions& tboptions,
@@ -75,8 +89,8 @@ Status BuildTable(
     Env::WriteLifeTimeHint write_hint, const std::string* full_history_ts_low,
     BlobFileCompletionCallback* blob_callback, Version* version,
     uint64_t* num_input_entries, uint64_t* memtable_payload_bytes,
-    uint64_t* memtable_garbage_bytes) {
-  assert((tboptions.column_family_id ==
+    uint64_t* memtable_garbage_bytes, std::string smallest_key, std::string largest_key) {
+  assert((tboptions.column_family_id == 
           TablePropertiesCollectorFactory::Context::kUnknownColumnFamily) ==
          tboptions.column_family_name.empty());
   auto& mutable_cf_options = tboptions.moptions;
@@ -163,6 +177,11 @@ Status BuildTable(
         return s;
       }
 
+      uint64_t filename = meta->fd.GetNumber();
+      uint64_t level = 0;
+      uint64_t prediction_future = async_predict(filename, level, versions->GetDistance(), ToHex(smallest_key), ToHex(largest_key)).get();
+
+      fs->SetFileLifetime(fname, prediction_future, versions->GetDistance(), 0);
       table_file_created = true;
       FileTypeSet tmp_set = ioptions.checksum_handoff_file_types;
       file->SetIOPriority(tboptions.write_options.rate_limiter_priority);
