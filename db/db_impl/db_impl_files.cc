@@ -9,6 +9,8 @@
 #include <cinttypes>
 #include <set>
 #include <unordered_set>
+#include <iomanip>
+#include <fstream>
 
 #include "db/db_impl/db_impl.h"
 #include "db/event_helpers.h"
@@ -391,6 +393,14 @@ void DBImpl::DeleteObsoleteFileImpl(int job_id, const std::string& fname,
                     file_deletion_status.ToString().c_str());
   }
   if (type == kTableFile) {
+
+    /*
+    Table File 삭제 이벤트 발생 시 Distance 로깅을 위한 로직입니다.
+    */
+    std::ofstream log_file("/root/lsm2/log/model.csv", std::ios_base::app);
+    FileInfo curr = versions_->getFileInfo(number);
+    log_file << curr.fd << "," << curr.level << "," << curr.distance << "," << versions_->GetDistance() << "," << curr.min_key << "," << curr.max_key << std::endl;
+
     EventHelpers::LogAndNotifyTableFileDeletion(
         &event_logger_, job_id, number, fname, file_deletion_status, GetName(),
         immutable_db_options_.listeners);
