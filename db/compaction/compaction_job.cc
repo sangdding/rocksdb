@@ -1869,6 +1869,45 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
   }
   fo_copy.temperature = temperature;
 
+  const auto* input_levels =
+      const_cast<Compaction*>(sub_compact->compaction)->inputs();
+  if (input_levels == nullptr || input_levels->empty()) {
+    ROCKS_LOG_WARN(db_options_.info_log,
+                   "No input levels found for compaction.");
+  }
+
+  Slice min_key;
+  Slice max_key;
+
+  const Comparator* ucmp =
+      sub_compact->compaction->column_family_data()->user_comparator();
+  if (ucmp == nullptr) {
+    ROCKS_LOG_WARN(db_options_.info_log, "Comparator is null.");
+  }
+  for (const auto& input_level : *input_levels) {
+    for (const auto* file : input_level.files) {
+      if (file == nullptr) {
+        ROCKS_LOG_WARN(db_options_.info_log,
+                       "FileMetaData is null in input level.");
+        continue;
+      }
+      // 최소 키 업데이트
+      if (min_key.empty() ||
+          ucmp->Compare(file->smallest.user_key(), min_key) < 0) {
+        min_key = file->smallest.user_key();
+      }
+      // 최대 키 업데이트
+      if (max_key.empty() ||
+          ucmp->Compare(file->largest.user_key(), max_key) > 0) {
+        max_key = file->largest.user_key();
+      }
+    }
+  }
+
+  // Slice를 문자열로 변환
+  std::string min_key_str(min_key.data(), min_key.size());
+  std::string max_key_str(max_key.data(), max_key.size());
+
   Status s;
   IOStatus io_s = NewWritableFile(fs_.get(), fname, &writable_file, fo_copy);
   s = io_s;
@@ -1948,6 +1987,9 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
                       sub_compact->compaction->mutable_cf_options()
                           ->check_flush_compaction_key_order,
                       paranoid_file_checks_);
+
+    versions_->AddFileInfo(meta.fd.GetNumber(), sub_compact->compaction->output_level(), versions_->GetDistance(), min_key_str, max_key_str);
+    versions_->IncrementDistance();
   }
 
   writable_file->SetIOPriority(GetRateLimiterPriority());
