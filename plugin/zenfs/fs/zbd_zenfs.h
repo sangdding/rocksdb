@@ -62,6 +62,7 @@ class Zone {
   uint64_t capacity_; /* remaining capacity */
   uint64_t max_capacity_;
   uint64_t wp_;
+  uint64_t max_distance_;
   Env::WriteLifeTimeHint lifetime_;
   std::atomic<uint64_t> used_capacity_;
 
@@ -149,6 +150,8 @@ class ZonedBlockDevice {
   uint32_t finish_threshold_ = 0;
   std::atomic<uint64_t> bytes_written_{0};
   std::atomic<uint64_t> gc_bytes_written_{0};
+  std::atomic<uint64_t> curr_distance_{0};
+
 
   std::atomic<long> active_io_zones_;
   std::atomic<long> open_io_zones_;
@@ -183,7 +186,9 @@ class ZonedBlockDevice {
   Zone *GetIOZone(uint64_t offset);
 
   IOStatus AllocateIOZone(Env::WriteLifeTimeHint file_lifetime, IOType io_type,
-                          Zone **out_zone);
+                          Zone **out_zone, uint64_t curr_distance,
+                          uint64_t predict_distance, int level);
+
   IOStatus AllocateMetaZone(Zone **out_meta_zone);
 
   uint64_t GetFreeSpace();
@@ -238,7 +243,7 @@ class ZonedBlockDevice {
   IOStatus FinishCheapestIOZone();
   IOStatus GetBestOpenZoneMatch(Env::WriteLifeTimeHint file_lifetime,
                                 unsigned int *best_diff_out, Zone **zone_out,
-                                uint32_t min_capacity = 0);
+                                uint64_t predict_distance, uint32_t min_capacity = 0);
   IOStatus AllocateEmptyZone(Zone **zone_out);
 };
 

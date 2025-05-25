@@ -26,6 +26,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <algorithm>
 
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
@@ -59,6 +60,7 @@ Zone::Zone(ZonedBlockDevice *zbd, ZonedBlockDeviceBackend *zbd_be,
   lifetime_ = Env::WLTH_NOT_SET;
   used_capacity_ = 0;
   capacity_ = 0;
+  max_distance_ = 0;
   if (zbd_be->ZoneIsWritable(zones, idx))
     capacity_ = max_capacity_ - (wp_ - start_);
 }
@@ -97,6 +99,7 @@ IOStatus Zone::Reset() {
 
   wp_ = start_;
   lifetime_ = Env::WLTH_NOT_SET;
+  max_distance_ = 0;
 
   return IOStatus::OK();
 }
@@ -590,9 +593,9 @@ IOStatus ZonedBlockDevice::FinishCheapestIOZone() {
 }
 
 IOStatus ZonedBlockDevice::GetBestOpenZoneMatch(
-    Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out,
-    Zone **zone_out, uint32_t min_capacity) {
-  unsigned int best_diff = LIFETIME_DIFF_NOT_GOOD;
+  Env::WriteLifeTimeHint /*file_lifetime*/, unsigned int *best_diff_out,
+  Zone **zone_out, uint64_t predict_distance, uint32_t min_capacity) {
+  unsigned int best_diff = 10;
   Zone *allocated_zone = nullptr;
   IOStatus s;
 
@@ -600,7 +603,8 @@ IOStatus ZonedBlockDevice::GetBestOpenZoneMatch(
     if (z->Acquire()) {
       if ((z->used_capacity_ > 0) && !z->IsFull() &&
           z->capacity_ >= min_capacity) {
-        unsigned int diff = GetLifeTimeDiff(z->lifetime_, file_lifetime);
+        // unsigned int diff = GetLifeTimeDiff(z->lifetime_, file_lifetime);
+        int64_t diff = std::llabs(static_cast<int64_t>(z->max_distance_) - static_cast<int64_t>(predict_distance));
         if (diff <= best_diff) {
           if (allocated_zone != nullptr) {
             s = allocated_zone->CheckRelease();
@@ -703,7 +707,7 @@ IOStatus ZonedBlockDevice::TakeMigrateZone(Zone **out_zone,
 
   unsigned int best_diff = LIFETIME_DIFF_NOT_GOOD;
   auto s =
-      GetBestOpenZoneMatch(file_lifetime, &best_diff, out_zone, min_capacity);
+    GetBestOpenZoneMatch(file_lifetime, &best_diff, out_zone, curr_distance_ + 50, min_capacity);
   if (s.ok() && (*out_zone) != nullptr) {
     Info(logger_, "TakeMigrateZone: %lu", (*out_zone)->start_);
   } else {
@@ -714,7 +718,7 @@ IOStatus ZonedBlockDevice::TakeMigrateZone(Zone **out_zone,
 }
 
 IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
-                                          IOType io_type, Zone **out_zone) {
+                                          IOType io_type, Zone **out_zone, uint64_t curr_distance, uint64_t predict_distance, int /*level*/) {
   Zone *allocated_zone = nullptr;
   unsigned int best_diff = LIFETIME_DIFF_NOT_GOOD;
   int new_zone = 0;
@@ -733,6 +737,9 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
   ZenFSMetricsLatencyGuard guard(metrics_, tag, Env::Default());
   metrics_->ReportQPS(ZENFS_IO_ALLOC_QPS, 1);
 
+  curr_distance_ = curr_distance;
+  if (predict_distance == 0) predict_distance = curr_distance_;
+
   // Check if a deferred IO error was set
   s = GetZoneDeferredStatus();
   if (!s.ok()) {
@@ -748,8 +755,9 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
 
   WaitForOpenIOZoneToken(io_type == IOType::kWAL);
 
-  /* Try to fill an already open zone(with the best life time diff) */
-  s = GetBestOpenZoneMatch(file_lifetime, &best_diff, &allocated_zone);
+  // Try to fill an already open zone(with the best life time diff)
+  s = GetBestOpenZoneMatch(file_lifetime, &best_diff, &allocated_zone, predict_distance);
+
   if (!s.ok()) {
     PutOpenIOZoneToken();
     return s;
@@ -809,6 +817,7 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
   }
 
   if (allocated_zone) {
+    allocated_zone->max_distance_ = std::max(allocated_zone->max_distance_, predict_distance);
     assert(allocated_zone->IsBusy());
     Debug(logger_,
           "Allocating zone(new=%d) start: 0x%lx wp: 0x%lx lt: %d file lt: %d\n",
