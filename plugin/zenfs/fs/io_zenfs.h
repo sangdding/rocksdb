@@ -49,6 +49,12 @@ class MetadataWriter {
 };
 
 class ZoneFile {
+  
+ public:
+  uint64_t predict_distance = 0;
+  uint64_t curr_distance = 0;
+  int level;
+
  private:
   const uint64_t NO_EXTENT = 0xffffffffffffffff;
 

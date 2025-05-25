@@ -1134,6 +1134,20 @@ IOStatus ZenFS::AreFilesSame(const std::string& file, const std::string& linkf,
   return s;
 }
 
+IOStatus ZenFS::SetFileLifetime(std::string fname, uint64_t predict_distance,
+                                uint64_t curr_distance, int level) {
+  std::string f = FormatPathLexically(fname);
+  if (files_.find(f) == files_.end()) {
+    return IOStatus::IOError("Can't find file:" + fname);
+  } else {
+    std::shared_ptr<ZoneFile> tmp = files_[f];
+    tmp->predict_distance = predict_distance;
+    tmp->curr_distance = curr_distance;
+    tmp->level = level;
+    return IOStatus::OK();
+  }
+}
+
 void ZenFS::EncodeSnapshotTo(std::string* output) {
   std::map<std::string, std::shared_ptr<ZoneFile>>::iterator it;
   std::string files_string;

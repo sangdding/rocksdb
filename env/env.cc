@@ -549,6 +549,13 @@ class LegacyFileSystemWrapper : public FileSystem {
     return status_to_io_status(target_->NewLogger(fname, result));
   }
 
+  IOStatus SetFileLifetime(std::string fname, uint64_t predict_distance,
+                           uint64_t curr_distance, int level) override {
+    Status s =
+        target_->SetFileLifetime(fname, predict_distance, curr_distance, level);
+    return status_to_io_status(std::move(s));
+  }
+
   void SanitizeFileOptions(FileOptions* opts) const override {
     target_->SanitizeEnvOptions(opts);
   }

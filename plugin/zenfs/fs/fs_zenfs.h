@@ -332,6 +332,9 @@ class ZenFS : public FileSystemWrapper {
                                 const IOOptions& options, bool* res,
                                 IODebugContext* dbg) override;
 
+  virtual IOStatus SetFileLifetime(std::string fname, uint64_t predict_distance,
+                                   uint64_t curr_distance, int level);
+
   IOStatus GetFileSize(const std::string& f, const IOOptions& options,
                        uint64_t* size, IODebugContext* dbg) override;
 

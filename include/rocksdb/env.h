@@ -555,6 +555,9 @@ class Env : public Customizable {
   virtual Status GetAbsolutePath(const std::string& db_path,
                                  std::string* output_path) = 0;
 
+  virtual Status SetFileLifetime(std::string fname, uint64_t predict_distance,
+                                 uint64_t curr_distance, int level) = 0;
+
   // The number of background worker threads of a specific thread pool
   // for this environment. 'LOW' is the default pool.
   // default number: 1
@@ -1583,6 +1586,13 @@ class EnvWrapper : public Env {
                    std::shared_ptr<Logger>* result) override {
     return target_.env->NewLogger(fname, result);
   }
+
+  Status SetFileLifetime(std::string fname, uint64_t predict_distance,
+                         uint64_t curr_distance, int level) override {
+    return target_.env->SetFileLifetime(fname, predict_distance, curr_distance,
+                                        level);
+  }
+  
   uint64_t NowMicros() override { return target_.env->NowMicros(); }
   uint64_t NowNanos() override { return target_.env->NowNanos(); }
   uint64_t NowCPUNanos() override { return target_.env->NowCPUNanos(); }

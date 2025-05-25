@@ -906,6 +906,11 @@ class PosixFileSystem : public FileSystem {
     }
     return io_s;
   }
+  
+  IOStatus SetFileLifetime(std::string fname, uint64_t predict_distance,
+                           uint64_t curr_distance, int level) override {
+    return SetFileLifetime(fname, predict_distance, curr_distance, level);
+  }
 
   FileOptions OptimizeForLogWrite(const FileOptions& file_options,
                                   const DBOptions& db_options) const override {

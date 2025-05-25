@@ -186,6 +186,12 @@ class CompositeEnv : public Env {
     return file_system_->GetTestDirectory(io_opts, path, &dbg);
   }
 
+  Status SetFileLifetime(std::string fname, uint64_t predict_distance,
+                         uint64_t curr_distance, int level) {
+    return file_system_->SetFileLifetime(fname, predict_distance, curr_distance,
+                                         level);
+  }
+
   EnvOptions OptimizeForLogRead(const EnvOptions& env_options) const override {
     return file_system_->OptimizeForLogRead(FileOptions(env_options));
   }

@@ -95,6 +95,12 @@ class MockFileSystem : public FileSystem {
   IOStatus NewLogger(const std::string& fname, const IOOptions& io_opts,
                      std::shared_ptr<Logger>* result,
                      IODebugContext* dbg) override;
+
+  IOStatus SetFileLifetime(std::string /*fname*/, uint64_t /*predict_distance*/,
+                           uint64_t /*curr_distance*/, int /*level*/) {
+    return IOStatus::NotSupported("SetFileLifetime");
+  }
+  
   // Get full directory name for this db.
   IOStatus GetAbsolutePath(const std::string& db_path,
                            const IOOptions& /*options*/,

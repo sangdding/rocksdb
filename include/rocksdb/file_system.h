@@ -597,6 +597,10 @@ class FileSystem : public Customizable {
                                    std::string* output_path,
                                    IODebugContext* dbg) = 0;
 
+  // 파일 수명 설정 인터페이스
+  virtual IOStatus SetFileLifetime(std::string fname, uint64_t predict_distance,
+                                   uint64_t curr_distance, int level) = 0;
+
   // Sanitize the FileOptions. Typically called by a FileOptions/EnvOptions
   // copy constructor
   virtual void SanitizeFileOptions(FileOptions* /*opts*/) const {}
@@ -1545,6 +1549,12 @@ class FileSystemWrapper : public FileSystem {
     return target_->NewLogger(fname, options, result, dbg);
   }
 
+  IOStatus SetFileLifetime(std::string fname, uint64_t predict_distance,
+                           uint64_t curr_distance, int level) override {
+    return target_->SetFileLifetime(fname, predict_distance, curr_distance,
+                                    level);
+  }
+  
   void SanitizeFileOptions(FileOptions* opts) const override {
     target_->SanitizeFileOptions(opts);
   }
