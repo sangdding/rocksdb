@@ -23,6 +23,11 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <iostream>
+#include <thread>
+#include <cstdlib>
+#include <stdexcept>
+#include <future>
 
 #include "db/arena_wrapped_db_iter.h"
 #include "db/builder.h"
@@ -6680,6 +6685,38 @@ void DBImpl::RecordSeqnoToTimeMapping(uint64_t populate_historical_seconds) {
     // Always successful assuming seqno never go backwards
     seqno_to_time_mapping_.Append(seqno, unix_time);
   }
+}
+
+
+// 예측 함수 구현부
+std::future<uint64_t> async_predict(uint64_t filename, uint64_t level, uint64_t curr_distance, std::string min_key, std::string max_key) {
+  return std::async(std::launch::async, [=]() -> uint64_t {
+      std::ostringstream command;
+      command << "python3 /root/lsm2/rocksdb/prediction.py "
+              << std::to_string(filename) << " "
+              << std::to_string(level) << " "
+              << std::to_string(curr_distance) << " "
+              << min_key << " "
+              << max_key;
+      // Run the Python script and capture its output
+      std::array<char, 128> buffer;
+      std::string result;
+      FILE* pipe = popen(command.str().c_str(), "r");
+      if (!pipe) throw std::runtime_error("Failed to open pipe for Python script execution");
+
+      while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
+          result += buffer.data();
+      }
+
+      pclose(pipe);
+
+      // Convert the string result to uint64_t
+      try {
+          return std::stoull(result);
+      } catch (const std::exception& e) {
+          throw std::runtime_error("Failed to convert prediction result to uint64_t");
+      }
+  });
 }
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <future>
 
 #include "db/column_family.h"
 #include "db/compaction/compaction_iterator.h"
@@ -2972,4 +2973,8 @@ inline Status DBImpl::FailIfReadCollapsedHistory(const ColumnFamilyData* cfd,
   }
   return Status::OK();
 }
+
+// 예측 함수 정의
+std::future<uint64_t> async_predict(uint64_t filename, uint64_t level, uint64_t curr_distance, std::string min_key, std::string max_key);
+
 }  // namespace ROCKSDB_NAMESPACE
