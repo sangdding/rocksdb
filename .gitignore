@@ -100,3 +100,4 @@ third-party/folly/
 *.sublime-*
 
 plugin/zenfs/log
+plugin/zenfs/util
